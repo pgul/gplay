@@ -1,0 +1,40 @@
+CC = gcc
+LINK = gcc
+CYGWIN=/cygdrive/i
+#CFLAGS = -I $(CYGWIN)/usr/include/mingw $(DEFINES) -Wall -Wno-char-subscripts \
+#         -O2 -D__WIN32__ -DWIN32 -funsigned-char -g -DDEBUG=10
+#LFLAGS = -L$(CYGWIN)/usr/lib/mingw -L$(CYGWIN)/usr/lib \
+# $(CYGWIN)/usr/lib/mingw/crt2.o $(CYGWIN)/usr/lib/mingw/CRT_noglob.o
+#LIBS = -lmingw32 -lmsvcrt -lcoldname -lkernel32
+CFLAGS = -Wall -g -D__WIN32__ -DWIN32 -funsigned-char -g #-DDEBUG=10
+LFLAGS = -g
+LIBS = 
+O = o
+
+OBJ = objcyg/gplay.$(O) objcyg/scrlmenu.$(O) objcyg/db.$(O) objcyg/config.$(O) objcyg/cline.$(O)
+
+.c.$(o):
+	$(CC) -c $(CFLAGS) -o $@ $<
+
+all:	gplaycyg.exe dbmgrcyg.exe
+
+objcyg/gplay.$(O): gplay.c gplay.h
+	$(CC) -c $(CFLAGS) -o $@ $<
+objcyg/db.$(O): db.c gplay.h
+	$(CC) -c $(CFLAGS) -o $@ $<
+objcyg/scrlmenu.$(O): scrlmenu.c
+	$(CC) -c $(CFLAGS) -o $@ $<
+objcyg/dbmgr.$(O): dbmgr.c gplay.h
+	$(CC) -c $(CFLAGS) -o $@ $<
+objcyg/config.$(O): config.c gplay.h
+	$(CC) -c $(CFLAGS) -o $@ $<
+objcyg/cline.$(O): cline.c
+	$(CC) -c $(CFLAGS) -o $@ $<
+
+gplaycyg.exe:	$(OBJ)
+	$(LINK) $(LFLAGS) -o $@ $(OBJ) -lglib $(LIBS)
+dbmgrcyg.exe:	objcyg/db.$(O) objcyg/dbmgr.$(O) objcyg/config.$(O)
+	$(LINK) $(LFLAGS) -o $@ $^ $(LIBS)
+
+clean:
+	rm -f objcyg/*.obj objcyg/*.o gplaycyg.exe dbmgrcyg.exe

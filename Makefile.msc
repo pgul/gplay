@@ -1,0 +1,29 @@
+CC = cl
+LINK = cl
+O = obj
+CFLAGS=/c /W3 /Zi /J /Fo$@ /DWIN32 /D_CONSOLE
+LFLAGS=/W3 /Zi /MT /Fe$@ 
+
+OBJ = gplay.$(O) scrlmenu.$(O) db.$(O) config.$(O) getopt.$(O) dirent.$(O)
+OBJDB = db.$(O) dbmgr.$(O) config.$(O)
+
+.c.$(o):
+	$(CC) $(CFLAGS) $<
+
+all:	gplayw.exe dbmgrw.exe
+
+gplay.$(O): gplay.c gplay.h
+db.$(O): db.c gplay.h
+scrlmenu.$(O): scrlmenu.c
+dbmgr.$(O): dbmgr.c gplay.h
+config.$(O): config.c gplay.h
+getopt.$(O): getopt.c getopt.h
+dirent.$(O): dirent.c
+
+gplayw.exe:	$(OBJ)
+	$(LINK) $(LFLAGS) $(OBJ) glib.lib
+dbmgrw.exe:	$(OBJDB)
+	$(LINK) $(LFLAGS) $(OBJDB)
+
+clean:
+	rm -f objwin/*.obj objwin/*.o gplayw.exe dbmgrw.exe

@@ -1,0 +1,33 @@
+CC = gcc
+LINK = gcc
+CFLAGS = -funsigned-char -Wall -Wno-char-subscripts -mno-cygwin -O2 -s # -g -DDEBUG=10
+O = o
+LFLAGS = $(CFLAGS)
+
+OBJ = objmgw/gplay.$(O) objmgw/scrlmenu.$(O) objmgw/db.$(O) objmgw/config.$(O) # objmgw/getopt.$(O)
+
+.c.$(o):
+	$(CC) -c $(CFLAGS) -o $@ $<
+
+all:	gplayw.exe dbmgrw.exe
+
+objmgw/gplay.$(O): gplay.c gplay.h
+	$(CC) -c $(CFLAGS) -o $@ $<
+objmgw/db.$(O): db.c gplay.h
+	$(CC) -c $(CFLAGS) -o $@ $<
+objmgw/scrlmenu.$(O): scrlmenu.c
+	$(CC) -c $(CFLAGS) -o $@ $<
+objmgw/dbmgr.$(O): dbmgr.c gplay.h
+	$(CC) -c $(CFLAGS) -o $@ $<
+objmgw/config.$(O): config.c gplay.h
+	$(CC) -c $(CFLAGS) -o $@ $<
+objmgw/getopt.$(O): getopt.c getopt.h
+	$(CC) -c $(CFLAGS) -o $@ $<
+
+gplayw.exe:	$(OBJ)
+	$(LINK) $(LFLAGS) -o $@ $(OBJ) -lglib -lmsvcrt
+dbmgrw.exe:	objmgw/db.$(O) objmgw/dbmgr.$(O) objmgw/config.$(O)
+	$(LINK) $(LFLAGS) -o $@ $^
+
+clean:
+	rm -f objmgw/*.obj objmgw/*.o gplayw.exe dbmgrw.exe

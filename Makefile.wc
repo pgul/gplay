@@ -1,0 +1,33 @@
+CC = wcc386
+LINK = wcl386
+CFLAGS = -w3 -bm -d2 -DOS2 -Dftruncate=chsize
+O = obj
+LFLAGS = $(CFLAGS)
+
+OBJ = obj2/gplay.$(O) obj2/scrlmenu.$(O) obj2/db.$(O) obj2/config.$(O) obj2/getopt.$(O)
+
+.c.obj:
+	$(CC) $(CFLAGS) /fo=$@ $<
+
+All:	gplayw.exe dbmgrw.exe
+
+obj2/gplay.$(O): gplay.c gplay.h
+	$(CC) $(CFLAGS) /fo=obj2\gplay.$(O) $<
+obj2/db.$(O): db.c gplay.h
+	$(CC) $(CFLAGS) /fo=obj2\db.$(O) $<
+obj2/scrlmenu.$(O): scrlmenu.c
+	$(CC) $(CFLAGS) /fo=obj2\scrlmenu.$(O) $<
+obj2/dbmgr.$(O): dbmgr.c gplay.h
+	$(CC) $(CFLAGS) /fo=obj2\dbmgr.$(O) $<
+obj2/config.$(O): config.c gplay.h
+	$(CC) $(CFLAGS) /fo=obj2\config.$(O) $<
+obj2/getopt.$(O): getopt.c getopt.h
+	$(CC) $(CFLAGS) /fo=obj2\getopt.$(O) $<
+
+gplayw.exe:	$(OBJ)
+	$(LINK) $(LFLAGS) /fe=$@ obj2\gplay.$(O) obj2\db.$(O) obj2\scrlmenu.$(O) obj2\config.$(O) obj2\getopt.$(O) glibp.lib
+dbmgrw.exe:	obj2/db.$(O) obj2/dbmgr.$(O) obj2/config.$(O)
+	$(LINK) $(LFLAGS) /fe=$@ obj2\dbmgr.$(O) obj2\db.$(O) obj2\config.$(O)
+
+clean:
+	rm -f objemx/*.obj objemx/*.o gplaye.exe dbmgr.exe
