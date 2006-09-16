@@ -5,10 +5,9 @@ gplay:
 - delete dirs
 - recode filenames/dirnames cp1251->cp866
 - sometimes lost keys
-- updir -> to saved position
 - home -> Ctrl/PgUp, end -> Ctrl/PgDn
-- garbage in empty "Comment" field
 - different colors for files/dirs/disks (white dirs, green disks)
 - edit: insert, Ctrl/A, Ctrl/E, Ctrl/U, backspace
 - hang after f8 while playing
 - mpg123 plays small end part of prev interrupted song in the start of next
+- mpg123: sometimes incorrect (jumping) position indicator

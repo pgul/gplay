@@ -1032,11 +1032,15 @@ comment     : [--== ZoLtaR's MP3 Archive ==--תת]
       putcol(col_play_text, 10, 75, 4);
       putcol(col_play_hilight, 10, 16, 30);
       putcol(col_play_hilight, 10, 52, 19);
-      cline(10, 1, "comment     : [                                ]  [                   ]  descr");
       if (cur->comment[0])
-        cnline(10, 52, cur->comment, 19);
-      if (strlen(p)>101)
-      { cnline(10, 16, p+101, 30);
+      {
+        cline(10, 1, "description : [                                                       ]");
+        cnline(10, 16, cur->comment, 55);
+      }
+      else if (strlen(p)>101)
+      {
+        cline(10, 1, "comment     : [                                                       ]");
+        cnline(10, 16, p+101, 30);
 #if 0
         if (cur->comment[0])
         { char *p1 = p+130;
