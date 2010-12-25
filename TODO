@@ -1,13 +1,33 @@
 gplay:
 - help (F1)
-- screen speedup (glib)
-- scrlmenu: mouse wheel support
 - delete dirs
-- recode filenames/dirnames cp1251->cp866
-- sometimes lost keys
-- home -> Ctrl/PgUp, end -> Ctrl/PgDn
 - different colors for files/dirs/disks (white dirs, green disks)
 - edit: insert, Ctrl/A, Ctrl/E, Ctrl/U, backspace
-- hang after f8 while playing
-- mpg123 plays small end part of prev interrupted song in the start of next
-- mpg123: sometimes incorrect (jumping) position indicator
+? built-in mpg321
+- os2
+  - screen speedup (glib)
+  - scrlmenu: mouse wheel support
+  - sometimes lost keys
+- win
+  - mpg123 plays small end part of prev interrupted song in the start of next
+  - mpg123 traps (escape, next, exit)
+  - hide/show cursor
+  - volume indicator
+  - title (URL, colors on "WIN")
+  - "dbmgrw check" -> "database corrupted"
+  - speedup (screen updates), timecritical
+  - mpg123 diagnostics, waiting
+  ? recode filenames/dirnames from cp1251
+- unix
+  - multibyte characters
+  ? show long file names
+  - catch SIGWINCH
+  - sometimes traps when mpg321 unexpected output (i.e. mpg321 exit)
+  - gulib:
+    - multibyte characters
+    - does not work drag scrollbar by mouse
+    - bottom-right char in screen
+    - mouse wheel support
+    - use koi8-r and utf-8 graphics (like elinks)
+    - work in console (not only in xterm)
+    ? slang support

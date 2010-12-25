@@ -4,9 +4,12 @@
 #include <ctype.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#ifdef __OS2__
+#if defined(__OS2__)
 #define INCL_DOSPROCESS
 #include <os2.h>
+#elif defined(UNIX)
+#include <unistd.h>
+#include <pwd.h>
 #else
 #include <io.h>
 #ifdef __CYGWIN__
@@ -16,15 +19,15 @@
 #endif
 #include <windows.h>
 #endif
-#include "glib.h"
 #include "keyc.h"
 #include "gplay.h"
 
-int col_menu_normal,
+chtype
+    col_menu_normal,
     col_menu_title, 
     col_menu_select, 
-    col_menu_tagged;
-int col_play_normal,
+    col_menu_tagged,
+    col_play_normal,
     col_play_clicable,
     col_play_volume1,
     col_play_volume2,
@@ -38,13 +41,21 @@ int col_play_normal,
     col_play_ramka2,
     col_play_tape,
     col_play_tapecur,
-    col_play_brackets;
-int col_edit_ramka,
+    col_play_brackets,
+    col_edit_ramka,
     col_edit_text;
 
-char mpg123[1024] = "mpg123.exe";
+char mpg123[1024] = "mpg123";
 char playlists[1024] = "";
 static char startdir[1024] = "";
+#ifdef UNIX
+char scr_charset[80] = "koi8-u";
+#else
+char scr_charset[80] = "cp866";
+#endif
+char mp3_charset[80] = "cp1251";
+char dir_charset[80] = "utf-8";
+char db_charset[80]  = "utf-8";
 
 static int col_menu_bg,
            col_menu_title_bg,
@@ -92,7 +103,12 @@ static struct {
 { "STARTDIR",			PAR_PATH,	startdir,		0 },
 { "DBNAME",			PAR_PATH,	dbname,			0 },
 
-{ "VOLUME",			PAR_DIG,	&volume,		50 }
+{ "VOLUME",			PAR_DIG,	&volume,		50 },
+
+{ "SCR_CHARSET",		PAR_STRING,	&scr_charset,		0 },
+{ "MP3_CHARSET",		PAR_STRING,	&mp3_charset,		0 },
+{ "DIR_CHARSET",		PAR_STRING,	&dir_charset,		0 },
+{ "DB_CHARSET",			PAR_STRING,	&db_charset,		0 }
 };
 
 #ifdef __CYGWIN__
@@ -136,30 +152,68 @@ int config(char *confname)
     }
     else
       myname = "gplay.exe";
-#else
+#elif !defined(UNIX)
     myname = strdup((char *)GetCommandLine());
     p = strchr(myname, ' ');
     if (p) *p='\0';
 #endif
   }
+#ifdef UNIX
+  myname=getenv("HOME");
+  if (!myname)
+  {
+    struct passwd *pw;
+    if ((pw = getpwuid(getuid())) != NULL)
+      myname = pw->pw_dir;
+    if (myname == NULL) myname = "/";
+  }
+#endif
   if (confname == NULL)
   { confname = malloc(1024);
     if (confname == NULL)
       exit(3);
+#ifdef UNIX
+    strncpy(confname, myname, 1000);
+    strcat(confname, "/");
+    strcat(confname, "gplay.cfg");
+    if (access(confname, R_OK))
+    {
+      strncpy(confname, myname, 1000);
+      strcat(confname, "/.gplay/");
+      strcat(confname, "gplay.cfg");
+      if (access(confname, R_OK))
+      {
+        strcpy(confname, "/usr/local/etc/gplay.cfg");
+        if (access(confname, R_OK))
+        {
+          strcpy(confname, "/etc/gplay.cfg");
+          if (access(confname, R_OK))
+            strcpy(confname, "gplay.cfg");
+        }
+      }
+    }
+#else
     strcpy(confname, myname);
-    p=strrchr(confname, '\\');
+    p=strrchr(confname, PATHSEP);
     if (p==NULL) p=confname;
     else p++;
     strcpy(p, "gplay.cfg");
+#endif
   }
+  debug(1, "read config file %s", confname);
   strcpy(playlists, myname);
-  p=strrchr(playlists, '\\');
+#ifdef UNIX
+  if (strlen(playlists) + 11 < sizeof(playlists))
+    strcat(playlists, "/playlists");
+#else
+  p=strrchr(playlists, PATHSEP);
   if (p && (p!=playlists) && (playlists[1]!=':' || p!=playlists+2))
     *p='\0';
   else if (p)
     p[1]='\0';
   else
     getcwd(playlists, sizeof(playlists));
+#endif
   f=fopen(confname, "r");
   if (f)
   {
@@ -236,12 +290,13 @@ int config(char *confname)
           { fprintf(stderr, "Path %s does not exists!\n", p);
             continue;
           }
-          strncpy((char *)(params[i].val), p, 1024);
+          strncpy((char *)(params[i].val), p, 1023);
           continue;
         case PAR_DIG:
           *(int *)(params[i].val) = atoi(p);
           continue;
         case PAR_STRING:
+          strncpy((char *)(params[i].val), p, 79);
           ;
       }
     }
@@ -270,17 +325,28 @@ int config(char *confname)
   col_edit_text    |= col_edit_text_bg << 4;
 
   if (startdir[0])
-  { if (startdir[1] == ':')
+  {
+#ifndef UNIX
+    if (startdir[1] == ':')
 #ifdef __OS2__
       DosSetDefaultDisk(toupper(startdir[0])-'A'+1);
 #else
       _chdrive(toupper(startdir[0])-'A');
 #endif
+#endif
     chdir(startdir);
   }
 
   if (dbname[0] == '\0')
-  { strcpy(dbname, playlists);
+  {
+#ifdef UNIX
+    strcpy(dbname, myname);
+    strcat(dbname, "/.gplay");
+    if (access(dbname, R_OK))
+      strcpy(dbname, myname);
+#else
+    strcpy(dbname, playlists);
+#endif
     if (strchr("/\\", dbname[strlen(dbname)-1]) == NULL)
       strcat(dbname, "/");
     strcat(dbname, "gplaydb");

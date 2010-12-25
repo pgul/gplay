@@ -3,9 +3,15 @@
 #ifndef _GETOPT_H
 #define _GETOPT_H
 
+#if 0
 #define _getopt getopt
 #define _optind optind
 #define _optarg optarg
+#else
+#define getopt _getopt
+#define optind _optind
+#define optarg _optarg
+#endif
 
 extern char *optarg;       /* argument of current option                    */
 extern int optind;         /* index of next argument; default=0: initialize */

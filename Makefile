@@ -1,31 +1,41 @@
 CC = gcc
 LINK = gcc
-CFLAGS = -funsigned-char -Wall -Wno-char-subscripts -Zomf -Zcrtdll -Zmt -DOS2 -O2 -s
-O = obj
+CFLAGS = -funsigned-char -Wall -Wno-char-subscripts -DUNIX -I../gulib
+CFLAGS += -DHAVE_RVOLUME -DHAVE_ICONV
+CFLAGS += -DMACOS
+CFLAGS += -g
+O = o
 LFLAGS = $(CFLAGS)
+LIBS = -lpthread
+LIBS += -lncurses
+#LIBS += -lslang
+LIBS += -liconv
 
-OBJ = objemx/gplay.$(O) objemx/scrlmenu.$(O) objemx/db.$(O) objemx/config.$(O)
+OBJ = obj/gplay.$(O) obj/db.$(O) obj/config.$(O) obj/debug.${O}
+OBJ += obj/getopt.${O}
 
-.c.obj:
-	$(CC) -c $(CFLAGS) -o $@ $<
-
-All:	gplay.exe dbmgr.exe
-
-objemx/gplay.$(O): gplay.c gplay.h
-	$(CC) -c $(CFLAGS) -o $@ $<
-objemx/db.$(O): db.c gplay.h
-	$(CC) -c $(CFLAGS) -o $@ $<
-objemx/scrlmenu.$(O): scrlmenu.c
-	$(CC) -c $(CFLAGS) -o $@ $<
-objemx/dbmgr.$(O): dbmgr.c gplay.h
-	$(CC) -c $(CFLAGS) -o $@ $<
-objemx/config.$(O): config.c gplay.h
+.c.o:
 	$(CC) -c $(CFLAGS) -o $@ $<
 
-gplay.exe:	$(OBJ)
-	$(LINK) $(LFLAGS) -o $@ $(OBJ) -lglibpe
-dbmgr.exe:	objemx/db.$(O) objemx/dbmgr.$(O) objemx/config.$(O)
+All:	gplay dbmgr
+
+obj/gplay.$(O): gplay.c gplay.h Makefile
+	$(CC) -c $(CFLAGS) -o $@ $<
+obj/db.$(O): db.c gplay.h Makefile
+	$(CC) -c $(CFLAGS) -o $@ $<
+obj/dbmgr.$(O): dbmgr.c gplay.h Makefile
+	$(CC) -c $(CFLAGS) -o $@ $<
+obj/config.$(O): config.c gplay.h Makefile
+	$(CC) -c $(CFLAGS) -o $@ $<
+obj/debug.$(O): debug.c gplay.h Makefile
+	$(CC) -c $(CFLAGS) -o $@ $<
+obj/getopt.$(O): getopt.c gplay.h Makefile
+	$(CC) -c $(CFLAGS) -o $@ $<
+
+gplay:	$(OBJ) ../gulib/gulib.a Makefile
+	$(LINK) $(LFLAGS) -o $@ $(LIBS) $(OBJ) ../gulib/gulib.a
+dbmgr:	obj/db.$(O) obj/dbmgr.$(O) obj/config.${O} obj/debug.${O}
 	$(LINK) $(LFLAGS) -o $@ $^
 
 clean:
-	rm -f objemx/*.obj objemx/*.o gplaye.exe dbmgr.exe
+	rm -f obj/*.o obj/*.o

@@ -2,8 +2,14 @@
 #include <stdarg.h>
 #include <string.h>
 #include <errno.h>
+#ifdef UNIX
+#include <pthread.h>
+#include <locale.h>
+#include <signal.h>
+#else
 #include <malloc.h>
 #include <process.h>
+#endif
 #include <ctype.h>
 #include <stdlib.h>
 #ifndef _MSC_VER
@@ -11,14 +17,16 @@
 #endif
 #include <sys/types.h>
 #include <sys/stat.h>
+#ifndef UNIX
 #include <io.h>
+#endif
 #include <fcntl.h>
 #include <time.h>
 #if defined(__WATCOMC__)
 #include "getopt.h"
 #include <direct.h>
 #define waitpid(pid, stat, opt) cwait(stat, pid, WAIT_CHILD)
-#elif defined(__MINGW32__) || defined(__CYGWIN__)
+#elif defined(__MINGW32__) || defined(__CYGWIN__) || defined(UNIX)
 #include <dirent.h>
 #else // MSVC
 #include "dirent.h"
@@ -31,10 +39,20 @@
 #define INCL_DOSERRORS
 #include <os2.h>
 #define INVALID_TID_VALUE 0
+#elif defined(UNIX)
+typedef pthread_t TID;
+#define INVALID_TID_VALUE (TID)-1
+#include <sys/wait.h>
+#ifdef MACOS
+#include "getopt.h"
+#endif
 #else
 #include <windows.h>
 #define INVALID_TID_VALUE INVALID_HANDLE_VALUE
 typedef HANDLE TID;
+#if !defined(__CYGWIN__) && !defined(__MINGW32__)
+#include <locale.h>
+#endif
 #if defined(__CYGWIN__) || defined(__MINGW32__)
 #include <getopt.h>
 #else
@@ -48,17 +66,28 @@ typedef HANDLE TID;
 #define waitpid(pid, stat, opt) cwait(stat, pid, 0)
 #endif
 #endif
-#include "glib.h"
+#ifdef HAVE_ICONV
+#include <iconv.h>
+#endif
 #include "keyc.h"
 #include "gplay.h"
 
+#ifndef HAVE_ICONV
 static char win2alt[] = 
 #include "win2alt.h"
+#endif
 
+#if defined(MACOS)
+//#define MPG123ARGS  "-o", "esd", "-R", "qq"
+#define MPG123ARGS  "-R", "qq"
+#elif defined(UNIX)
+#define MPG123ARGS  "-R", "qq"
+#else
 #define MPG123ARGS  "-R", "--reopen"
+#endif
 #define LISTEXT     ".lst"
 
-#if defined(__EMX__) || defined(__CYGWIN__)
+#if defined(__EMX__) || defined(__CYGWIN__) || defined(UNIX)
 #define PATHSEP     '/'
 #define PATHSEPS    "/"
 #else
@@ -70,8 +99,10 @@ static char win2alt[] =
 #define	S_ISDIR(m)	(((m)&S_IFMT) == S_IFDIR)
 #endif
 
-void barcell(int cell, int x, int y, int sx, int sy);
-void back_key_first(int c);
+#ifndef max
+#define max(a, b)	((a) > (b) ? (a) : (b))
+#endif
+#define max3(a, b, c)	max(max(a, b), c)
 
 int  color_menu=bluef+very+sky,
      color_menu_select=whitef+black,
@@ -85,6 +116,7 @@ int playing, paused;
 int volume=40;
 int forever=0, rnd=0;
 int maxx, maxy;
+int pid123=-1;
 char *head;
 #ifdef __CYGWIN__
 HANDLE mpgin, mpgout;
@@ -94,16 +126,21 @@ FILE *mpgin, *mpgout;
 #ifdef __OS2__
 FILE *resppipein, *resppipeout;
 char pipename[1024];
+#elif defined(UNIX)
+FILE *resppipein, *resppipeout;
+int  edpipe[2] = {-1, -1};
+int  editing;
 #endif
 int firstsong;
 int dbopened=0;
 TID resptid;
-#ifndef __OS2__
+#if !defined(__OS2__) && !defined(UNIX)
 HANDLE fifosem = INVALID_HANDLE_VALUE;
 HANDLE fifoevt = INVALID_HANDLE_VALUE;
 char fifo[8192];
 int fifohead=0, fifolen=0;
 #endif
+static TID inkeytid, edittid=INVALID_TID_VALUE;
 
 struct lemtype
   { char filename[256];
@@ -138,7 +175,9 @@ int pipe(int filedes[2])
 }
 #endif
 
-#ifndef __OS2__
+static int run123(void);
+
+#if !defined(__OS2__) && !defined(UNIX)
 int waitthread(HANDLE tid)
 { DWORD rc;
   while (GetExitCodeThread(tid, &rc))
@@ -149,37 +188,70 @@ int waitthread(HANDLE tid)
 }
 #endif
 
-#ifndef DEBUG
-#define DEBUG 0
-#endif
-#define dbgname		"i:\\work\\play\\mpg123\\dbg.log"
-int debug(int level, char *format, ...)
+static void strlwr(char *str)
 {
-  va_list arg;
-  FILE *f;
-  if (level >= DEBUG) return 0;
-  va_start(arg, format);
-  f=fopen(dbgname, "a");
-  if (f)
-  { vfprintf(f, format, arg);
-    fputs("\n", f);
-    fclose(f);
+	while (*str) {
+		*str = tolower(*str);
+		str++;
+	}
+}
+
+static char *xlat(const char *from, const char *to, /* const */ char *str)
+{
+  static char *res=NULL;
+  static int  rsize=0;
+  int i;
+
+  i = strlen(str)+1;
+  if (rsize<i)
+  { rsize = (i+64)*4;
+    res=realloc(res, rsize);
   }
-  va_end(arg);
-#if 0
-  { char dbgbuf[60];
-    va_start(arg, format);
-    vsnprintf(dbgbuf, sizeof(dbgbuf), format, arg);
-    va_end(arg);
-    message(10, 10, " %s ", dbgbuf);
+  if (stricmp(from, to) == 0) {
+    strcpy(res, str);
+  } else
+#ifdef HAVE_ICONV
+  {
+    iconv_t ic;
+
+    ic = iconv_open(to, from);
+    if (ic != (iconv_t)-1) {
+      size_t l, l1;
+      char *p;
+
+      for (l=strlen(str), l1=rsize-1, p=res; l>0 && l1>0;)
+        if (iconv(ic, &str, &l, &p, &l1) == (size_t) -1) {
+          debug(1, "iconv error: %s", strerror(errno));
+          break;
+        }
+      *p = '\0';
+      iconv_close(ic);
+    } else {
+      strcpy(res, str);
+    }
+  }
+#else
+  if (stricmp(from, "cp1251") == 0 &&
+      stricmp(to, "cp866") == 0) {
+    char *p;
+    for (p=res; *str; p++, str++)
+      if (*str & 0x80)
+        *p = win2alt[*str & 0x7f];
+      else
+        *p=*str;
+    *p='\0';
+  } else {
+    strcpy(res, str);
   }
 #endif
-  return 0;
+  return res;
 }
 
 static void putfilename(int x, int y, char *name, int skoko)
 {
   char *str;
+
+  name = xlat(dir_charset, scr_charset, name);
   if (strlen(name)<=skoko)
   { cnline(x, y, name, skoko);
     return;
@@ -192,10 +264,11 @@ static void putfilename(int x, int y, char *name, int skoko)
   free(str);
 }
 
-char *putline(int num, int *col)
+char *putline(int num, chtype *col)
 {
   static char s[1024];
   static char size[40], name[256];
+
   if (lem[num].filename[1] == ':')
     strcpy(size, "  <Disk>  ");
   else if (strchr(lem[num].filename, PATHSEP))
@@ -207,13 +280,13 @@ char *putline(int num, int *col)
     sprintf(size, "    %3lu %03lu", lem[num].size/1000, lem[num].size%1000);
   else
     sprintf(size, "        %3lu", lem[num].size);
-#ifdef __EMX__
-  snprintf(name, sizeof(name), "%-20s", lem[num].filename);
+#if defined(__EMX__) || defined(UNIX)
+  snprintf(name, sizeof(name), "%-20s", xlat(dir_charset, scr_charset, lem[num].filename));
 #else
   sprintf(name, "%-20s", lem[num].filename);
 #endif
   name[20]='\0';
-  sprintf(s, "%s %-20s %11s %s", lem[num].tag ? "ş" : " ",
+  sprintf(s, "%s %-20s %11s %s", lem[num].tag ? xlat(src_charset, scr_charset, "”") : " ",
           name, size, lem[num].comment);
   s[maxy-2] = '\0';
   if (lem[num].tag) *col = col_menu_tagged;
@@ -229,9 +302,9 @@ static void printvolume(int volume)
   cline(12, 59, str);
   for (i=0; i<10; i++)
   { if (i+1>volume/10)
-      cchar(13, 52+i, '\7');
+      cchar(13, 52+i, '');
     else
-      cchar(13, 52+i, 'ş');
+      cchar(13, 52+i, '”');
     if (i+1>(volume+5)/10)
       putcol(col_play_normal, 13, 52+i, 1);
     else if (i<5)
@@ -246,7 +319,7 @@ static void printvolume(int volume)
 void sendcmd(char *format, ...)
 { va_list arg;
 
-#ifdef __CYGWIN__
+#if defined(__CYGWIN__)
   char buf[1024];
   int n;
   DWORD dw;
@@ -256,12 +329,22 @@ void sendcmd(char *format, ...)
   strcpy(buf+n, "\n");
   if (WriteFile(mpgin, buf, n+1, &dw, NULL) == 0 || dw != n+1)
 #else
+#if defined(UNIX) && !defined(HAVE_RVOLUME)
+  if (tolower(*format)=='v')  {
+    /* no volume control in mpg321/unix */
+    va_start(arg, format);
+    printvolume(va_arg(arg, int));
+    va_end(arg);
+    return;
+  }
+#endif
   va_start(arg, format);
   vfprintf(mpgin, format, arg);
   va_end(arg);
   if (fputs("\n", mpgin) == EOF || fflush(mpgin) == EOF)
 #endif
-    message(10, 10, " Can't write to pipe: %s! ", strerror(errno));
+    /* message(10, 10, " Can't write to pipe: %s! ", strerror(errno)); */
+    debug(1, "Can't write to pipe: %s!", strerror(errno));
 #if 0
 va_start(arg, format);
 fprintf(stdout, format, arg);
@@ -269,17 +352,16 @@ fputs("\n", stdout);
 fflush(stdout);
 va_end(arg);
 #endif
-#if DEBUG>4
+  if (debuglevel > 4)
   { char buf[1024];
     va_start(arg, format);
     vsnprintf(buf, sizeof(buf)-1, format, arg);
     va_end(arg);
     debug(5, ">> %s", buf);
   }
-#endif
 }
 
-#ifndef __OS2__
+#if !defined(__OS2__) && !defined(UNIX)
 void put_fifo(char *format, ...)
 { va_list arg;
   char tstr[2048], *p;
@@ -317,9 +399,9 @@ void put_fifo(char *format, ...)
 
 char *resp(int wait)
 {
-  static char sresp[sizeof(fifo)+1];
   char *p;
 #ifdef __OS2__
+  static char sresp[sizeof(fifo)+1];
   ULONG actual, state;
   AVAILDATA avail;
 
@@ -331,7 +413,66 @@ char *resp(int wait)
   if (fgets(sresp, sizeof(sresp), resppipein)==NULL)
     return NULL;
   for (p=sresp+strlen(sresp)-1; isspace(*p) && p>=sresp; *p--='\0');
+#elif defined(UNIX)
+  static char sresp[8192];
+  fd_set sr;
+  struct timeval tv;
+  int n, h1, h2;
+
+  debug(2, "resp(%d) called", wait);
+repselect:
+  FD_ZERO(&sr);
+  h1 = -1;
+  if (editing == 0 && resppipein) {
+    h1=fileno(resppipein);
+    FD_SET(h1, &sr);
+  }
+  if (pid123 == -1) {
+    run123();
+    return "@Q 0\n";
+  }
+  h2=fileno(mpgout);
+  debug(4, "call select(), h1=%d, h2=%d, edpipe=%d", h1, h2, edpipe[0]);
+  FD_SET(h2, &sr);
+  FD_SET(edpipe[0], &sr);
+  tv.tv_sec = tv.tv_usec = 0;
+  if (wait) tv.tv_sec = 5; /* 3 sec timeout */
+  n = select(max3(h1, h2, edpipe[0]) + 1, &sr, NULL, NULL, &tv);
+  if (n == 0) {
+    if (wait != 1) return NULL;
+    debug(1, "Timeout, interrupt mpg321");
+    if (pid123 != -1) kill(pid123, SIGTERM);
+    return "@Q 0\n";
+  }
+  if (n < 0) {
+    if (errno==EAGAIN || errno==EINTR) goto repselect;
+    debug(1, "select() error: %s!", strerror(errno));
+    return NULL;
+  }
+  debug(2, "resp: found response");
+  if (h1!=-1 && FD_ISSET(h1, &sr) && !editing)
+  { debug(1, "get from resppipein");
+    if (fgets(sresp, sizeof(sresp), resppipein)==NULL)
+      return NULL;
+  } else if (FD_ISSET(h2, &sr))
+  { if (pid123 == -1)
+    { debug(1, "mpg123 finished, restart it");
+      fclose(mpgin);
+      fclose(mpgout);
+      mpgout = mpgin = NULL;
+      run123();
+      return "@Q 0\n";
+    }
+    if (fgets(sresp, sizeof(sresp), mpgout)==NULL)
+      return NULL;
+  } else if (FD_ISSET(edpipe[0], &sr))
+  { read(edpipe[0], &n, 1);
+    goto repselect;
+  } else
+    goto repselect;
+  for (p=sresp+strlen(sresp)-1; isspace(*p) && p>=sresp; *p--='\0');
 #else
+  static char sresp[sizeof(fifo)+1];
   int i;
 debug(2, "resp(%d) called", wait);
   if (fifosem == INVALID_HANDLE_VALUE)
@@ -369,11 +510,12 @@ debug(2, "resp: found response");
   p[i] = '\0';
   ReleaseMutex(fifosem);
   SetEvent(fifoevt);
-debug(2, "<< %s", sresp);
 #endif
+  debug(2, "<< %s", sresp);
   return sresp;
 }
 
+#ifndef UNIX
 #ifdef __CYGWIN__
 int hgets(char *sr, size_t size, HANDLE h)
 { static char hbuf[1024];
@@ -401,7 +543,7 @@ debug(3, "hgets: return %s", sr);
 { char dbuf[sizeof(hbuf)+1];
   memcpy(dbuf, hbuf, nhbuf);
   dbuf[nhbuf] = '\0';
-  debug(5, "hgets: received %s\n", dbuf);
+  debug(5, "hgets: received %s", dbuf);
 }
   }
 }
@@ -409,7 +551,7 @@ debug(3, "hgets: return %s", sr);
 #define hgets(str, size, file) fgets(str, size, file)
 #endif
 
-#ifdef __OS2__
+#if defined(__OS2__)
 void resp_thread(void *arg)
 #else
 DWORD WINAPI resp_thread(void *arg)
@@ -422,7 +564,7 @@ debug(1, "resp_thread started");
   {
 debug(2, "resp_thread: got %s", sr);
     if (*sr!='@') continue;
-#ifdef __OS2__
+#if defined(__OS2__)
     fputs(sr, resppipeout);
     fflush(resppipeout);
 #else
@@ -434,34 +576,74 @@ debug(1, "resp_thread end");
 #ifdef __OS2__
   _endthread();
 #else
-  ExitThread(0); return 0;
+  ExitThread(0);
+  return 0;
 #endif
 }
+#endif
+
+#ifdef UNIX
+static pthread_mutex_t sem_refresh;
+
+static void refresh_sem(int set)
+{
+  if (set)
+    pthread_mutex_lock(&sem_refresh);
+  else
+    pthread_mutex_unlock(&sem_refresh);
+}
+
+static int pipeinkey(void)
+{
+  char s[80];
+  int key;
+
+  if (resppipein == NULL)
+    return _inkey();
+  while (1)
+  {
+    refresh_sem(1);
+    g_refresh();
+    refresh_sem(0);
+    if (fgets(s, sizeof(s), resppipein) == NULL) break;
+    debug(2, "<< %s", s);
+    if (sscanf(s, "@K %d", &key) == 1)
+      return key;
+  }
+  return 0;
+}
+#endif
 
 //void APIENTRY inkey_thread(ULONG arg)
-#ifdef __OS2__
+#if defined(__OS2__)
 void inkey_thread(void *arg)
+#elif defined(UNIX)
+void *inkey_thread(void *arg)
 #else
 DWORD WINAPI inkey_thread(void *arg)
 #endif
 {
   int key;
-  while ((key=inkey())!=1)
-#ifdef __OS2__
-  { fprintf(resppipeout, "@K %d", key);
-    fflush(resppipeout);
-  }
-#else
+  while ((key=_inkey_norefresh())!=1)
   {
-    put_fifo("@K %d\n", key);
-debug(2, "inkey_thread: put key %d 0x%04x ('%c')", key, key, (char)key);
-  }
-#endif
-//  DosExit(EXIT_THREAD, 0);
-#ifdef __OS2__
-  _endthread();
+#if defined(__OS2__) || defined(UNIX)
+    if (fprintf(resppipeout, "@K %d\n", key) < 0)
+      debug(1, "fprintf to resppipeout error: %s", strerror(errno));
+    if (fflush(resppipeout))
+      debug(1, "fflush resppipeout error: %s", strerror(errno));
 #else
-   ExitThread(0); return 0;
+    put_fifo("@K %d\n", key);
+#endif
+    debug(2, "inkey_thread: put key %d 0x%04x ('%c')", key, key, (char)key);
+  }
+#ifdef __OS2__
+//  DosExit(EXIT_THREAD, 0);
+  _endthread();
+#elif defined(UNIX)
+   return NULL;
+#else
+   ExitThread(0);
+   return 0;
 #endif
 }
 
@@ -624,7 +806,7 @@ void editsong(int pole)
 {
   struct lemtype *cur;
   struct listtype  *l;
-  char comment[56];
+  char comment[56], *p;
   int  i;
 
   cur = lem+pole;
@@ -632,8 +814,8 @@ void editsong(int pole)
   comment[sizeof(comment)-1] = '\0';
   for (i=strlen(comment); i<sizeof(comment)-1; i++)
     comment[i] = ' ';
-  if (mkorr(col_edit_ramka, col_edit_text, 9, 5, 3, 70, 8,
-            "comment:", comment, 0)==0)
+  if (mkorr(col_edit_ramka, col_edit_text, 9, 5, 3, 68, 10,
+            " comment: ", comment, 0)==0)
   { remenu();
     return;
   }
@@ -641,11 +823,15 @@ void editsong(int pole)
   strcpy(cur->comment, comment);
   if ((l=searchlist(cur)) != NULL)
     strncpy(l->comment, cur->comment, sizeof(l->comment));
-  adddb(cur->size, cur->filename, comment);
+  p = strdup(xlat(dir_charset, db_charset, cur->filename));
+  adddb(cur->size, p, xlat(scr_charset, db_charset, comment));
+  free(p);
 }
 
-#ifdef __OS2__
+#if defined(__OS2__)
 void edit_thread(void *arg)
+#elif defined(UNIX)
+void *edit_thread(void *arg)
 #else
 DWORD WINAPI edit_thread(void *arg)
 #endif
@@ -660,8 +846,11 @@ DWORD WINAPI edit_thread(void *arg)
   comment[sizeof(comment)-1] = '\0';
   for (i=strlen(comment); i<sizeof(comment)-1; i++)
     comment[i] = ' ';
-  if (mkorr(col_edit_ramka, col_edit_text, 9, 5, 3, 70, 8,
-            "comment:", comment, 0)==0)
+#ifdef UNIX
+  editing++;
+#endif
+  if (mkorr(col_edit_ramka, col_edit_text, 9, 5, 3, 68, 10,
+            " comment: ", comment, 0)==0)
   { remenu();
     crsr_hide();
   }
@@ -669,6 +858,8 @@ DWORD WINAPI edit_thread(void *arg)
   {
     remenu();
     crsr_hide();
+    putcol(col_play_hilight, 10, 16, 55);
+    cline(10, 1, "description : [                                                       ]       ");
     cline(10, 16, comment);
     stripspc(comment);
     strcpy(cur->comment, comment);
@@ -682,12 +873,28 @@ DWORD WINAPI edit_thread(void *arg)
       p=p1+1;
     if ((p1=strrchr(p, '\\')) != NULL)
       p=p1+1;
-    adddb(cur->size, p, comment);
+    p1 = strdup(xlat(dir_charset, db_charset, p));
+    adddb(cur->size, p1, xlat(scr_charset, db_charset, comment));
+    free(p1);
   }
-#ifdef __OS2__
+#ifdef UNIX
+  refresh_sem(1);
+  g_refresh();
+  refresh_sem(0);
+  editing--;
+#endif
+  debug(4, ">> @E");
+#if defined(__OS2__)
   fputs("@E", resppipeout);
   fflush(resppipeout);
   _endthread();
+#elif defined(UNIX)
+  write(edpipe[1], "", 1);
+  if (fputs("@E\n", resppipeout) == EOF)
+    debug(1, "Cannot puts to resppipeout: %s", strerror(errno));
+  if (fflush(resppipeout) == EOF)
+    debug(1, "Cannot fflush resppipeout: %s", strerror(errno));
+  return NULL;
 #else
   put_fifo("@E");
   ExitThread(0); return 0;
@@ -750,14 +957,17 @@ int loaddir(void)
   struct stat st;
   char filename[1024];
   char curdir[256];
+#if !defined(UNIX)
   int  c;
-#ifndef __OS2__
+#if !defined(__OS2__)
   DWORD drives;
+#endif
 #endif
 
   poley=0;
   getcwd(curdir, sizeof(curdir));
   debug(4, "loaddir(), curdir=%s", curdir);
+#ifndef UNIX
 #ifdef __OS2__
   for (c=0; c<='Z'-'A'; c++)
   { if (DosSetDefaultDisk(c+1) == 0)
@@ -780,6 +990,7 @@ int loaddir(void)
   }
 #ifdef __OS2__
   DosSetDefaultDisk(toupper(curdir[0])-'A'+1);
+#endif
 #endif
   d = opendir(curdir);
   if (d==NULL)
@@ -818,8 +1029,8 @@ debug(4, "loaddir(): file %s", filename);
     { lem[poley].size=st.st_size;
       if (searchlist(lem+poley))
         lem[poley].tag=1;
-      if ((p=fetchdb(st.st_size, df->d_name, NULL)) != NULL)
-      { strncpy(lem[poley].comment, p, sizeof(lem->comment)-1);
+      if ((p=fetchdb(st.st_size, xlat(dir_charset, db_charset, df->d_name), NULL)) != NULL)
+      { strncpy(lem[poley].comment, xlat(db_charset, scr_charset, p), sizeof(lem->comment)-1);
         lem[poley].comment[sizeof(lem->comment)-1] = '\0';
       }
 debug(2, "loaddir: found %s -- %s", lem[poley].filename, lem[poley].comment);
@@ -863,55 +1074,67 @@ void play(void)
   char *ftype, *fmode;
   int bitrate, stereo, sf, layer;
   int key;
-  TID inkeytid, edittid=INVALID_TID_VALUE;
 /*
-Ú[Üş]ÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍ¿
-³ÛÛÛÛÛÛ²²²²²²±±±±±±°°°°° Z! v.2.4  mp3 player for OS/2! °°°°°±±±±±±²²²²²²ÛÛÛÛÛÛ³
-ÀÍÍÍµ code by dink  ::  http://dink.org  ::  this interface by Super Keyby ÆÍÍÍÙ
+‚[Œ”]                                                                          ƒ
+’’’’’’‘‘‘‘‘‘ Z! v.2.4  mp3 player for OS/2! ‘‘‘‘‘‘’’’’’’
+„   ² code by dink  ::  http://dink.org  ::  this interface by Super Keyby ¯   …
 
- playing file: [F:\pub\mp3\ksp\BelGvard\BgZnoy01.mp3úúúúúúúúúúúúúúúúúúúúúúúúú]
+ playing file: [F:\pub\mp3\ksp\BelGvard\BgZnoy01.mp3]
  file info   :  mpeg 1.0 layer III, 56kbit/s, 44100 Hz single-channel
 
- track name  : [úúúúúúúúúúúúúúúúúúúúúúúúúúúúúúúú]
- artist      : [úúúúúúúúúúúúúúúúúúúúúúúúúúúúúúúú]  [úúúú]                 year
- album       : [úúúúúúúúúúúúúúúúúúúúúúúúúúúúúúúú]  [úúúúúúúúúúúúúúúúúúú]  genre
- comment     : [úúúúúúúúúúúúúúúúúúúúúúúúúúúúúúúú]
+ track name  : []
+ artist      : []  []                 year
+ album       : []  []  genre
+ comment     : []
 
- total playing time [ú4:29]                        volume: ú15%
- time elapsed       [úú:19]                        [şúúúúúúúúú]
-                    [< ş >]                        [<- -şş- ->]
+ total playing time [4:29]                        volume: 15%
+ time elapsed       [:19]                        [”]
+                    [< ” >]                        [<- -””- ->]
 
- [şşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşş]
+ [””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””]
 
  [P]
-  ÀÄ-previous song: [F:\pub\mp3\ksp\BelGvard\Amulet14.mp3úúúúúúúúúúúúúúúúúúúú]
+  „€-previous song: [F:\pub\mp3\ksp\BelGvard\Amulet14.mp3]
  [N]
-  ÀÄ-next song    : [F:\pub\mp3\ksp\BelGvard\BgZnoy02.mp3úúúúúúúúúúúúúúúúúúúú]
+  „€-next song    : [F:\pub\mp3\ksp\BelGvard\BgZnoy02.mp3]
  [Q]                                      [<space>]
-  ÀÄ-quit back to file listing                ÀÄÄÄÄÄ-pause playback
+  „€-quit back to file listing                „€€€€€-pause playback
 
 */
 
+  debug(1, "play called");
   firstsong = 1;
   crsr_hide();
   evakuate(0,0,maxx,maxy);
+#ifdef UNIX
+  barputcol(col_play_normal, 0, 0, maxx, maxy);
+  barfill(' ' , 0, 0, maxx, maxy);
+#else
   barcell((col_play_normal<<8) | ' ', 0, 0, maxx, maxy);
+#endif
 #ifdef __OS2__
   DosSetPriority(PRTYS_PROCESS, PRTYC_TIMECRITICAL, 0, 0);
 #else
 //  SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
 #endif
+#ifdef UNIX
+  editing++;
   while (resp(0));
-//  DosCreateThread(&inkeytid, inkey_thread, 0, 0, 65536*4);
-#ifdef __OS2__
-  inkeytid = _beginthread(inkey_thread, 0, 65536*4, NULL);
+  editing--;
 #else
+  while (resp(0));
+#endif
+  debug(2, "resp queue purged");
+//  DosCreateThread(&inkeytid, inkey_thread, 0, 0, 65536*4);
+#if defined(__OS2__)
+  inkeytid = _beginthread(inkey_thread, 0, 65536*4, NULL);
+#elif !defined(UNIX)
   { DWORD id;
     inkeytid = CreateThread(NULL, 65536*4, inkey_thread, NULL, 0, &id);
   }
 #endif
   putcol(col_play_ramka1, 0, 0, 80);
-  cline(0, 0, "ÕÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍ¸");
+  cline(0, 0, xlat(src_charset, scr_charset, "¢                                                                              ¦"));
   putcol(col_play_ramka1, 1, 0, 1);
   putcol(col_play_ramka1, 1, 79, 1);
   putcol(col_play_firstlet, 1, 21, 1);
@@ -924,18 +1147,24 @@ void play(void)
   putcol(col_play_firstlet, 1, 42, 1);
   putcol(col_play_firstlet, 1, 55, 4);
   putcol(col_play_text2, 1, 57, 1);
-  cline(1, 0, "³ÛÛÛÛÛ²²²²²±±±±±°°°° GPlay ver " VER " mpg123 frontend for OS/2 °°°°±±±±±²²²²²ÛÛÛÛÛ³");
+  cline(1, 0, "’’’’’‘‘‘‘‘ GPlay ver " VER " mpg123 frontend for OS/2 ‘‘‘‘‘’’’’’");
+#elif defined(UNIX)
+  putcol(col_play_firstlet, 1, 35, 1);
+  putcol(col_play_firstlet, 1, 42, 1);
+  putcol(col_play_firstlet, 1, 55, 4);
+  //putcol(col_play_text2, 1, 57, 1);
+  cline(1, 0, xlat(src_charset, scr_charset, "’’’’’‘‘‘‘‘ GPlay ver " VER " mpg123 frontend for UNIX ‘‘‘‘‘’’’’’"));
 #else
   putcol(col_play_firstlet, 1, 36, 1);
   putcol(col_play_firstlet, 1, 43, 1);
   putcol(col_play_firstlet, 1, 56, 3);
-  cline(1, 0, "³ÛÛÛÛÛ²²²²²±±±±±°°°° GPlay ver " VER "  mpg123 frontend for WIN °°°°±±±±±²²²²²ÛÛÛÛÛ³");
+  cline(1, 0, "’’’’’‘‘‘‘‘ GPlay ver " VER "  mpg123 frontend for WIN ‘‘‘‘‘’’’’’");
 #endif
   putcol(col_play_ramka1, 2, 0, 1);
   putcol(col_play_ramka1, 2, 79, 1);
   putcol(col_play_ramka2, 2, 1, 4);
   putcol(col_play_ramka2, 2, 75, 4);
-  cline(2, 0, "ÔÍÍµ coded by Pavel Gulchouck : http://gul.kiev.ua : this interface from Z! ÆÍÍ¾");
+  cline(2, 0, xlat(src_charset, scr_charset, "©  ² coded by Pavel Gulchouck : http://gul.kiev.ua : this interface from Z! ¯  ¬"));
   if (rnd)
     lhead = toss(lhead);
   for (cur=lhead; ; )
@@ -953,13 +1182,23 @@ begloop:
     cline(4, 1,
 "playing file: [                                                            ]");
     putfilename(4, 16, cur->filename, 60);
+    refresh_sem(1);
+    g_refresh();
+    refresh_sem(0);
     do
     { p=resp(1);
-debug(2, "play: waiting for song info, got %s", p);
-    } while (p[1]!='I');
+debug(2, "play: waiting for song info, got %s", p ? p : "NULL");
+    } while (p && p[1]!='I' && strnicmp(p, "@P 0", 4) && strnicmp(p, "@Q 0",4));
+    if (p && p[1] == 'P') {
+      cur = nextsong(cur, 1);
+      continue;
+    }
+    if (p==NULL || p[1]=='Q') continue;
 /*
-@I ID3:®¢®à®â                       Œ è¨­  ‚à¥¬¥­¨
+@I ID3:ğÏ×ÏÒÏÔ                       íÁÛÉÎÁ ÷ÒÅÍÅÎÉ
                                                    Goa
+@I ID3:ğÏÓÌÅÄÎÑÑ ĞÏÜÍÁ               ëÉÎÏÛÌÑÇÅÒÙ                   åÇÉĞÔÑÎÉÎ                                                   http://rmp.ru
+@I ID3:BELLE (NOTRE DAME DE PARIS)   ğåôëõî,çïìõâå÷,íáëáòóëéê      BELLE (NOTRE DAME DE PARIS)   20020A125514                      Vocal
 Junk at the beginning 52494646
 Skipped RIFF header!
 @S 1.0 3 44100 Joint-Stereo 1 313 2 0 0 0 96 0
@@ -968,10 +1207,10 @@ Skipped RIFF header!
 @S 1.0 3 44100 Single-Channel 0 182 1 0 0 0 56 0
 
 @I ID3:Misirlou                      Dick Dale & His Del-Tones     Pulp Fiction Soundtrack       1994--== ZoLtaR's MP3 Archive ==--Soundtrack
-track name  : [Misirlouúúúúúúúúúúúúúúúúúúúúúúúú]
-artist      : [Dick Dale & His Del-Tonesúúúúúúú]  [1994]                 year
-album       : [Pulp Fiction Soundtrackúúúúúúúúú]  [Soundtrackúúúúúúúúú]  genre
-comment     : [--== ZoLtaR's MP3 Archive ==--úú]
+track name  : [Misirlou]
+artist      : [Dick Dale & His Del-Tones]  [1994]                 year
+album       : [Pulp Fiction Soundtrack]  [Soundtrack]  genre
+comment     : [--== ZoLtaR's MP3 Archive ==--]
 
 
 */
@@ -1013,34 +1252,32 @@ comment     : [--== ZoLtaR's MP3 Archive ==--úú]
     putcol(col_play_hilight2, 10, 13, 1);
     putcol(col_play_brackets, 10, 15, 1);
     putcol(col_play_brackets, 10, 71, 1);
-    if (strncmp(p+3, "ID3:", 4) == 0)
+    if (p && strncmp(p+3, "ID3:", 4) == 0)
     {
-      char *p1;
-      for (p1=p+7; *p1; p1++)
-        if (*p1 & 0x80)
-          *p1 = win2alt[*p1 & 0x7f];
-      cnline(7, 16, p+7, 30);
+      cnline(7, 16, xlat(mp3_charset, scr_charset, p+7), 30);
       if (strlen(p)>37)
-        cnline(8, 16, p+37, 30);
+        cnline(8, 16, xlat(mp3_charset, scr_charset, p+37), 30);
       if (strlen(p)>67)
-        cnline(9, 16, p+67, 30);
+        cnline(9, 16, xlat(mp3_charset, scr_charset, p+67), 30);
       if (strlen(p)>97)
-        cnline(8, 52, p+97, 4);
+        cnline(8, 52, xlat(mp3_charset, scr_charset, p+97), 4);
       putcol(col_play_brackets, 10, 48, 1);
       putcol(col_play_brackets, 10, 51, 1);
       putcol(col_play_firstlet, 10, 74, 1);
       putcol(col_play_text, 10, 75, 4);
-      putcol(col_play_hilight, 10, 16, 30);
-      putcol(col_play_hilight, 10, 52, 19);
       if (cur->comment[0])
       {
-        cline(10, 1, "description : [                                                       ]");
+        putcol(col_play_hilight, 10, 16, 55);
+        cline(10, 1, "description : [                                                       ]       ");
         cnline(10, 16, cur->comment, 55);
       }
-      else if (strlen(p)>101)
+      else
       {
-        cline(10, 1, "comment     : [                                                       ]");
-        cnline(10, 16, p+101, 30);
+        putcol(col_play_hilight, 10, 16, 30);
+        putcol(col_play_hilight, 10, 52, 19);
+        cline(10, 1, "comment     : [                                ]                       ");
+	if (strlen(p)>101)
+          cnline(10, 16, xlat(mp3_charset, scr_charset, p+101), 30);
 #if 0
         if (cur->comment[0])
         { char *p1 = p+130;
@@ -1054,21 +1291,28 @@ comment     : [--== ZoLtaR's MP3 Archive ==--úú]
 #endif
       }
       if (strlen(p)>131)
-        cnline(9, 52, p+131, 19);
+        cnline(9, 52, xlat(mp3_charset, scr_charset, p+131), 19);
     }
     else
     {
       putcol(col_play_hilight, 10, 16, 55);
-      cline(10, 1,"description : [                                                       ]       ");
+      cline(10, 1, "description : [                                                       ]       ");
       if (cur->comment[0])
         cnline(10, 16, cur->comment, 55);
+      else
+        fill(' ', 10, 16, 55);
     }
     do
     { p=resp(1);
-debug(2, "play: waiting for play start, got %s", p);
-    } while (p[1]!='S' && p[1]!='P');
-    if (strcmp(p, "@P 0") == 0)
-    { cur = nextsong(cur, 1);
+debug(2, "play: waiting for play start, got %s", p ? p : "NULL");
+    } while (p==NULL || (p && p[1]!='S' && p[1]!='P' && p[1]!='Q'));
+    if (p && strnicmp(p, "@P 0", 4) == 0)
+    { debug(2, "Next song");
+      cur = nextsong(cur, 1);
+      continue;
+    }
+    if (p && strnicmp(p, "@Q 0", 4) == 0)
+    { debug(2, "Restart song");
       continue;
     }
     putcol(col_play_firstlet, 5, 1, 1);
@@ -1079,16 +1323,21 @@ debug(2, "play: waiting for play start, got %s", p);
     cline(5, 1, "file info   :");
     p=strtok(p, " \t");
     ftype = strtok(NULL, " \t");
-    layer = atoi(strtok(NULL, " \t"));
-    sf = atoi(strtok(NULL, " \t"));
+    if (ftype == NULL) ftype = "?";
+    p = strtok(NULL, " \t"); /* layer */
+    layer = p ? atoi(p) : 1;
+    p = strtok(NULL, " \t"); /* sf */
+    sf = p ? atoi(p) : 0;
     fmode = strtok(NULL, " \t");
+    if (fmode == NULL) fmode = "?";
     p = strtok(NULL, " \t"); /* mode ext */
     p = strtok(NULL, " \t"); /* frame size */
     stereo = atoi(strtok(NULL, " \t"));
     p = strtok(NULL, " \t"); /* copyright */
     p = strtok(NULL, " \t"); /* error prot */
     p = strtok(NULL, " \t"); /* emphasis */
-    bitrate = atoi(strtok(NULL, " \t"));
+    p = strtok(NULL, " \t"); /* bitrate */
+    bitrate = p ? atoi(p) : 0;
     p = strtok(NULL, " \t"); /* extension */
     strlwr(fmode);
     sprintf(str, "mpeg %s layer %s, %ukbit/s, %u Hz %s",
@@ -1129,11 +1378,11 @@ debug(2, "play: waiting for play start, got %s", p);
     putcol(col_play_clicable, 14, 52, 2);
     putcol(col_play_clicable, 14, 60, 2);
     putcol(col_play_brackets, 14, 62, 1);
-    cline(14, 1, "                   [< ş >]                        [<- -şş- ->]");
+    cline(14, 1, xlat(src_charset, scr_charset, "                   [< ” >]                        [<- -””- ->]"));
     putcol(col_play_brackets, 16, 1, 1);
     putcol(col_play_tape,     16, 2,76);
     putcol(col_play_brackets, 16,78, 1);
-    cline(16, 1, "[şşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşşş]");
+    cline(16, 1, xlat(src_charset, scr_charset, "[””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””””]"));
     putcol(col_play_brackets, 18, 1, 3);
     putcol(col_play_clicable, 18, 2, 1);
     cline(18, 1, "[P]");
@@ -1145,7 +1394,7 @@ debug(2, "play: waiting for play start, got %s", p);
     putcol(col_play_brackets, 19, 20, 1);
     putcol(col_play_hilight , 19, 21,56);
     putcol(col_play_brackets, 19, 77, 1);
-    cline(19, 1, " ÀÄÄprevious song: [                                                        ]");
+    cline(19, 1, " „€€previous song: [                                                        ]");
     if (cur->prev)
       putfilename(19, 21, cur->prev->filename, 56);
     else if (forever && !firstsong)
@@ -1161,7 +1410,7 @@ debug(2, "play: waiting for play start, got %s", p);
     putcol(col_play_brackets, 21, 20, 1);
     putcol(col_play_hilight , 21, 21, 56);
     putcol(col_play_brackets, 21, 77, 1);
-    cline(21, 1, " ÀÄÄnext song    : [                                                        ]");
+    cline(21, 1, xlat(src_charset, scr_charset, " „€€next song    : [                                                        ]"));
     if (cur->next)
       putfilename(21, 21, cur->next->filename, 56);
     else if (forever)
@@ -1183,25 +1432,30 @@ debug(2, "play: waiting for play start, got %s", p);
     putcol(col_play_firstlet, 23, 53, 1);
     putcol(col_play_text,     23, 54, 13);
     putcol(col_play_firstlet, 23, 59, 1);
-    cline(23, 1, " ÀÄÄquit back to file listing                ÀÄÄÄÄÄÄpause playback");
-    tmouse_ch(14, 21, 1, 1, '<');
-    tmouse_ch(14, 25, 1, 1, '>');
-    tmouse_ch(14, 52, 1, 2, leftc);
-    tmouse_ch(14, 60, 1, 2, rightc);
-    tmouse_ch(18,  2, 1, 1, 'P');
-    tmouse_ch(20,  2, 1, 1, 'N');
-    tmouse_ch(22,  2, 1, 1, 'Q');
-    tmouse_ch(22, 43, 1, 7, spacec);
+    cline(23, 1, xlat(src_charset, scr_charset, " „€€quit back to file listing                „€€€€€€pause playback"));
+    mouse_ch(14, 21, 1, 1, '<');
+    mouse_ch(14, 25, 1, 1, '>');
+    mouse_ch(14, 52, 1, 2, leftc);
+    mouse_ch(14, 60, 1, 2, rightc);
+    mouse_ch(18,  2, 1, 1, 'P');
+    mouse_ch(20,  2, 1, 1, 'N');
+    mouse_ch(22,  2, 1, 1, 'Q');
+    mouse_ch(22, 43, 1, 7, spacec);
     totaltime=totalframes=-1;
     prevelaps=-1;
     prevtape=-1;
     mode=PLAYING;
-    for (;cur;)
+    while (cur)
     { /* playing */
-      if ((p=resp(1))==NULL)
+      refresh_sem(1);
+      g_refresh();
+      refresh_sem(0);
+      if ((p=resp(mode==PLAYING ? 1 : -1))==NULL)
       {
 #ifdef __OS2__
         sleep(1);
+#elif defined(UNIX)
+        usleep(100000);
 #else
         Sleep(100);
 #endif
@@ -1217,6 +1471,10 @@ debug(2, "Playing, got %s", p);
           DosWaitThread(&edittid, DCWW_WAIT);
           edittid=INVALID_TID_VALUE;
           inkeytid = _beginthread(inkey_thread, 0, 65536*4, NULL);
+#elif defined(UNIX)
+	  pthread_join(edittid, NULL);
+          edittid=INVALID_TID_VALUE;
+          // pthread_create(&inkeytid, NULL, inkey_thread, NULL);
 #else
           DWORD id;
           // waitthread(edittid);
@@ -1255,15 +1513,18 @@ debug(2, "Playing, got %s", p);
           if (elapsed < 0) elapsed = 0;
           tape = elapsed*76/totaltime;
           if (tape!=prevtape)
-          { if (prevtape!=-1)
+          { if (prevtape!=-1) {
+              // cchar(16, 2+prevtape, '”');
               putcol(col_play_tape, 16, 2+prevtape, 1);
+            }
+            // cchar(16, 2+tape, acs.bar0);
             putcol(col_play_tapecur, 16, 2+tape, 1);
             prevtape=tape;
           }
         }
-        else if (p[1]=='P')
+        else if (p[1]=='P' || p[1]=='Q')
         {
-          if (p[3] == '0')
+          if (p[3] == '0' || p[3] == '3')
             break;
           if (p[3]=='1')
           { putcol(col_play_firstlet, 23, 52, 1);
@@ -1273,7 +1534,7 @@ debug(2, "Playing, got %s", p);
           else
           { putcol(col_play_text2, 23, 52, 1);
             putcol(col_play_firstlet, 23, 53, 1);
-            cline(23, 52, "Äpause");
+            cline(23, 52, "€pause");
           }
         }
         else if (p[1]=='V')
@@ -1289,7 +1550,7 @@ debug(2, "Playing, got %s", p);
           continue;
         p=strtok(p, " \t");
         key=atoi(strtok(NULL, " \t\r\n"));
-        switch(key)
+        switch (key)
         {
           case leftc:
             if (volume>0)
@@ -1318,12 +1579,16 @@ debug(2, "Playing, got %s", p);
             /* change comment */
             if (!dbopened)
               break;
+#ifndef UNIX
             back_key_first(1);
+#endif
 #ifdef __OS2__
             DosWaitThread(&inkeytid, DCWW_WAIT);
             edittid = _beginthread(edit_thread, 0, 65536*4, cur);
+#elif defined(UNIX)
+            pthread_create(&edittid, NULL, edit_thread, cur);
 #else
-            //waitthread(inkeytid);
+            // waitthread(inkeytid);
             { DWORD id;
               edittid = CreateThread(NULL, 65536*4, edit_thread, cur, 0, &id);
             }
@@ -1331,35 +1596,54 @@ debug(2, "Playing, got %s", p);
             break;
           case f8c:
             /* del file */
+delfile:
             { struct listtype *l = cur;
               int pole = 0;
+              char fname[40];
 
               if (mode == PLAYING)
-                sendcmd("pause");
-              { char fname[40];
-                if (strlen(l->filename)<40)
-                  strcpy(fname, l->filename);
-                else
-                { strcpy(fname, "...");
-                  strcpy(fname+3, l->filename+strlen(l->filename)-40+3+1);
-                }
-                back_key_first(1);
+              { sendcmd("pause");
+                do
+                  if ((p=resp(1)) == NULL)
 #ifdef __OS2__
-                DosWaitThread(&inkeytid, DCWW_WAIT);
+                    sleep(1);
+#elif defined(UNIX)
+                    usleep(100000);
 #else
-                //waitthread(inkeytid);
+                    Sleep(100);
 #endif
-                quere(redf+very+white, whitef+black, 10, 20, 2, 2, &pole,
-                    " Delete file ", fname,
-                    " Yes ", "Yy", " No ", "Nn");
-#ifdef __OS2__
-                inkeytid = _beginthread(inkey_thread, 0, 65536*4, NULL);
-#else
-                { DWORD id;
-                  inkeytid = CreateThread(NULL, 65536*4, inkey_thread, NULL, 0, &id);
-                }
-#endif
+                while (p==NULL || strnicmp(p, "@p 1", 4));
+	      }
+
+              if (strlen(l->filename)<40)
+                strcpy(fname, l->filename);
+              else
+              { strcpy(fname, "...");
+                strcpy(fname+3, l->filename+strlen(l->filename)-40+3+1);
               }
+#ifndef UNIX
+              back_key_first(1);
+#endif
+#ifdef __OS2__
+              DosWaitThread(&inkeytid, DCWW_WAIT);
+#elif !defined(UNIX)
+              //waitthread(inkeytid);
+#endif
+              quere(redf+very+yellow, whitef+black, 10, 20, 2, 2, &pole,
+                  " Delete file ", fname,
+                  " Yes ", "Yy", " No ", "Nn\x1b");
+#ifdef __OS2__
+              inkeytid = _beginthread(inkey_thread, 0, 65536*4, NULL);
+#elif defined(UNIX)
+              //pthread_create(&inkeytid, NULL, inkey_thread, NULL);
+              refresh_sem(1);
+              g_refresh();
+              refresh_sem(0);
+#else
+              { DWORD id;
+                inkeytid = CreateThread(NULL, 65536*4, inkey_thread, NULL, 0, &id);
+              }
+#endif
               if (pole == 1)
               { if (mode == PLAYING)
                   sendcmd("pause");
@@ -1382,12 +1666,15 @@ debug(2, "Playing, got %s", p);
                 if ((p=resp(1)) == NULL)
 #ifdef __OS2__
                   sleep(1);
+#elif defined(UNIX)
+                  usleep(100000);
 #else
                   Sleep(100);
 #endif
               while (p==NULL || strnicmp(p, "@p 0", 4));
               unlink(l->filename);
               loaddir();
+              debug(1, "File %s unlinked", l->filename);
               free(l);
             }
             goto begloop;
@@ -1418,13 +1705,19 @@ debug(2, "Playing, got %s", p);
                 break;
               case 'c':
               case 'C':
+              case 'e':
+              case 'E':
                 /* change comment */
                 if (!dbopened)
                   break;
+#ifndef UNIX
                 back_key_first(1);
+#endif
 #ifdef __OS2__
                 DosWaitThread(&inkeytid, DCWW_WAIT);
                 edittid = _beginthread(edit_thread, 0, 65536*4, cur);
+#elif defined(UNIX)
+                pthread_create(&edittid, NULL, edit_thread, cur);
 #else
                 //waitthread(inkeytid);
                 { DWORD id;
@@ -1453,6 +1746,7 @@ debug(2, "Playing, got %s", p);
                     ltail = l->prev;
                   }
                   free(l);
+		  inlist--;
                 }
                 goto begloop;
               case '>':
@@ -1483,6 +1777,8 @@ debug(2, "Playing, got %s", p);
 #endif
                 }
                 continue;
+              case 'd':
+                goto delfile;
             }
         }
       }
@@ -1495,6 +1791,10 @@ debug(2, "Playing, got %s", p);
       DosWaitThread(&edittid, DCWW_WAIT);
       edittid = INVALID_TID_VALUE;
       inkeytid = _beginthread(inkey_thread, 0, 65536*4, NULL);
+#elif defined(UNIX)
+      pthread_join(edittid, NULL);
+      edittid = INVALID_TID_VALUE;
+      // pthread_create(&inkeytid, NULL, inkey_thread, NULL);
 #elif 0
       DWORD id;
       waitthread(edittid);
@@ -1504,7 +1804,7 @@ debug(2, "Playing, got %s", p);
       DWORD id;
       for (;;)
       { DWORD rc;
-        if ((p=resp(1))==NULL)
+        if ((p=resp(-1))==NULL)
         { Sleep(1000);
           continue;
         }
@@ -1519,15 +1819,27 @@ debug(2, "Playing, got %s", p);
     }
     cur = nextsong(cur, 1);
   }
+  debug(1, "No next song");
   gmouse_cancel();
+#ifndef UNIX
   /* stop inkey thread */
   back_key_first(1);
+#endif
 #ifdef __OS2__
   DosWaitThread(&inkeytid, DCWW_WAIT);
+#elif defined(UNIX)
+  //pthread_join(inkeytid, NULL);
 #else
   //waitthread(inkeytid);
 #endif
+#ifdef UNIX
+  editing++;
   while (resp(0));
+  editing--;
+#else
+  while (resp(0));
+#endif
+  debug(2, "resp queue purged");
 #ifdef __OS2__
   DosSetPriority(PRTYS_PROCESS, PRTYC_REGULAR, 0, 0);
 #else
@@ -1542,13 +1854,13 @@ debug(2, "Playing, got %s", p);
 
   remenu();
   crsr_show();
+  debug(1, "play() finished");
 }
 
 #ifdef __OS2__
-int run123(void)
+static int run123(void)
 {
   int in[2], out[2], savein, saveout, saveerr;
-  int pid;
   int h;
 
   pipe(in);
@@ -1568,8 +1880,8 @@ int run123(void)
   fcntl(in[1],  F_SETFD, FD_CLOEXEC);
   fcntl(out[0], F_SETFD, FD_CLOEXEC);
 #endif
-  pid = spawnlp(P_NOWAIT, mpg123, mpg123, MPG123ARGS, NULL);
-  if (pid==-1)
+  pid123 = spawnlp(P_NOWAIT, mpg123, mpg123, MPG123ARGS, NULL);
+  if (pid123==-1)
     message(10, 10, " Can't run %s: %s ", mpg123, strerror(errno));
   mpgin =fdopen(in[1], "w");
   mpgout=fdopen(out[0],"r");
@@ -1579,7 +1891,7 @@ int run123(void)
   close(savein);
   close(saveout);
   close(saveerr);
-  if (pid==-1) return -1;
+  if (pid123==-1) return -1;
   /* create npipe resppipein, resppipeout */
   sprintf(pipename, "\\PIPE\\GPLAY_%04X", getpid());
   if (DosCreateNPipe(pipename, (PHPIPE)&h, NP_NOINHERIT|NP_ACCESS_DUPLEX,
@@ -1600,7 +1912,69 @@ int run123(void)
   if (resppipein==NULL)
     fprintf(stderr, "Can't fopen pipe!\n"), exit(1);
   resptid = _beginthread(resp_thread,  NULL, 32786, NULL);
-  return pid;
+  resp(1);
+  sendcmd("volume %d", volume);
+debug(2, "sendcmd ok");
+  resp(1);
+debug(2, "set volume ok");
+  return pid123;
+}
+
+#elif defined(UNIX)
+
+static int run123(void)
+{
+  int in[2], out[2];
+
+  pipe(in);
+  pipe(out);
+  pid123 = fork();
+  if (pid123 == 0) {
+    /* give up controlling terminal */
+    // setsid();
+    dup2(in[0],  fileno(stdin));
+    dup2(out[1], fileno(stdout));
+    dup2(out[1], fileno(stderr));
+    close(in[0]);
+    close(in[1]);
+    close(out[0]);
+    close(out[1]);
+    execlp(mpg123, mpg123, MPG123ARGS, NULL);
+    exit(0);
+  }
+  else if (pid123 == -1) {
+    message(10, 10, " Can't run %s: %s ", mpg123, strerror(errno));
+    exit(1);
+  }
+  close(in[0]);
+  close(out[1]);
+  mpgin =fdopen(in[1], "w");
+  mpgout=fdopen(out[0],"r");
+  if (pid123==-1) return -1;
+  resp(1);
+  sendcmd("volume %d", volume);
+debug(2, "sendcmd ok");
+#if defined(HAVE_RVOLUME)
+  resp(1);
+debug(2, "set volume ok");
+#endif
+  return pid123;
+}
+
+static void rip(int signo)
+{
+  int r;
+  if (signo != SIGCHLD) return;
+  if (waitpid(pid123, &r, WNOHANG) == pid123) {
+    if (WIFSIGNALED(r))
+      debug(1, "mpg123 finished by %s", strsignal(WTERMSIG(r)));
+    else
+      debug(1, "mpg123 finished with retcode %u", WEXITSTATUS(r));
+    pid123 = -1;
+  }
+  // while (wait(NULL) != -1);
+  signal(SIGCHLD, rip);
+  return;
 }
 
 #else
@@ -1640,7 +2014,7 @@ static int CreateChildProcess(char *command, ...)
 	return -1;
 }
 
-int run123(void)
+static int run123(void)
 { 
    int pid;
    DWORD ThreadId;
@@ -1802,13 +2176,23 @@ int run123(void)
      message(10, 10, "Can't create thread: error %lu", GetLastError());
    else
      debug(1, "resp_thread created, tid %ld", (long)resptid);
+   resp(1);
+   sendcmd("volume %d", volume);
+debug(2, "sendcmd ok");
+   resp(1);
+debug(2, "set volume ok");
    return pid;
 } 
 #endif
 
 int myinkey(void)
 { int r;
+
+#ifdef UNIX
+  inkey=pipeinkey;
+#else
   inkey=_inkey;
+#endif
   r=biginkey(
         "Help  SavLstLdListEdit              SearchDelFil      Exit  ",
         "                                    SrcNxt                  ",
@@ -1824,8 +2208,11 @@ int addlistfile(char *name)
   struct lemtype *l;
   struct stat st;
 
-  if (stat(name, &st)) return 1;
-  // if (access(name, R_OK)) return 1;
+  if (stat(name, &st)) {
+    debug(1, "Cannot stat %s: %s", name, strerror(errno));
+    return 1;
+  }
+  if (access(name, R_OK)) return 1;
   if (ltail == NULL)
   { ltail = malloc(sizeof(*ltail));
     if (ltail == NULL)
@@ -1846,8 +2233,8 @@ int addlistfile(char *name)
   if (p == NULL) p=name;
   else p++;
   if (strrchr(p, '\\')) p = strrchr(p, '\\')+1;
-  if ((p=fetchdb(st.st_size, p, NULL)) != NULL)
-  { strncpy(ltail->comment, p, sizeof(ltail->comment)-1);
+  if ((p=fetchdb(st.st_size, xlat(dir_charset, db_charset, p), NULL)) != NULL)
+  { strncpy(ltail->comment, xlat(db_charset, scr_charset, p), sizeof(ltail->comment)-1);
     ltail->comment[sizeof(ltail->comment)-1] = '\0';
   }
   else
@@ -1871,7 +2258,8 @@ int loadlistfile(char *listfile, int clean)
   if (strchr("/\\", playlists[strlen(playlists)-1])==NULL)
     strcat(name, PATHSEPS);
   strcat(name, listfile);
-  strcat(name, LISTEXT);
+  if (strchr(listfile, '.') == NULL)
+    strcat(name, LISTEXT);
   if ((f=fopen(name, "r"))==NULL)
   { message(10, 10, " Can't open %s: %s! ", name, strerror(errno));
     return 1;
@@ -1895,7 +2283,7 @@ int loadlist(int clean)
 {
   DIR *d;
   struct dirent *df;
-  char **listnames=NULL;
+  char **listnames=NULL, **slistnames=NULL;
   int nlistnames=0;
   int pole, upline, r;
   char *p;
@@ -1923,9 +2311,12 @@ int loadlist(int clean)
     if (S_ISDIR(st.st_mode))
       continue;
     listnames=realloc(listnames, (nlistnames + 1) * sizeof(*listnames));
+    slistnames=realloc(slistnames, (nlistnames + 1) * sizeof(*slistnames));
     listnames[nlistnames] = strdup(df->d_name);
     p=strrchr(listnames[nlistnames], '.');
     *p='\0';
+    slistnames[nlistnames] = strdup(xlat(dir_charset, scr_charset, listnames[nlistnames]));
+    *p='.';
     nlistnames++;
   }
   closedir(d);
@@ -1938,16 +2329,19 @@ int loadlist(int clean)
   evakuate(5, maxy/2-10, maxx-7, 24);
   do
     r=scrlmenu(col_edit_ramka, col_edit_text, 5, maxy/2-10, maxx-10, 20,
-               "Select playlist", &pole, &upline, nlistnames, listnames);
+               "Select playlist", &pole, &upline, nlistnames, slistnames);
   while (r!=escc && r!=enterc && r!=mouse_enter);
   if (r!=escc)
     pole = loadlistfile(listnames[pole], clean);
   else
     pole = 1;
   remenu();
-  for (nlistnames--;nlistnames>=0;nlistnames--)
-    free(listnames[nlistnames]);
+  for (nlistnames--; nlistnames>=0; nlistnames--)
+  { free(listnames[nlistnames]);
+    free(slistnames[nlistnames]);
+  }
   free(listnames);
+  free(slistnames);
   return 1;
 }
 
@@ -1961,7 +2355,7 @@ int savelist(void)
 savelistagain:
   strcpy(name, "                    ");
   if (mkorr(col_edit_ramka, col_edit_text, 10, 20, 3, 40, 10,
-            "listname:", name, 0)==0)
+            " listname: ", name, 0)==0)
   { remenu();
     return 1;
   }
@@ -1970,19 +2364,21 @@ savelistagain:
   strcpy(fname, playlists);
   if (strchr("/\\", fname[strlen(fname)-1])==NULL)
     strcat(fname, "/");
-  strcat(fname, name);
+  strcat(fname, xlat(scr_charset, dir_charset, name));
   strcat(fname, LISTEXT);
   if (access(fname, 0) == 0)
   { int pole=0;
-    quere(redf+very+white, whitef+black, 10, 20, 4, 2, &pole,
-          "File", name, " already exists. ", "Overwrite?",
-          " Yes ", "Yy", " No ", "Nn");
+    quere(redf+very+yellow, whitef+black, 10, 20, 4, 2, &pole,
+          "File", xlat(dir_charset, scr_charset, name),
+          " already exists. ", "Overwrite?",
+          " Yes ", "Yy", " No ", "Nn\x1b");
     if (pole==1)
       goto savelistagain;
   }
   f = fopen(fname, "w");
   if (f == NULL)
-  { message(10, 10, " Can't open %s: %s! ", name, strerror(errno));
+  { message(10, 10, " Can't open %s: %s! ",
+            xlat(dir_charset, scr_charset, name), strerror(errno));
     return 1;
   }
   for (l = lhead; l; l = l->next)
@@ -2000,7 +2396,7 @@ void searchnext(int direction)
   char copystr[sizeof(searchstr)];
   char *p;
   int  i;
-  int  col=0;
+  chtype col=0;
 
   strcpy(copystr, searchstr);
   strlwr(copystr);
@@ -2030,8 +2426,8 @@ void search(int direction)
     searchstr[i] = ' ';
   searchstr[sizeof(searchstr)-1] = '\0';
   crsr_show();
-  if (mkorr(col_edit_ramka, col_edit_text, 9, 5, 3, 70, 11,
-            (direction==1) ? "search fwd:" : "search bck:", searchstr, 0)==0)
+  if (mkorr(col_edit_ramka, col_edit_text, 9, 5, 3, 70, 13,
+            (direction==1) ? " search fwd: " : " search bck: ", searchstr,0)==0)
   { remenu();
     crsr_hide();
     stripspc(searchstr);
@@ -2050,6 +2446,8 @@ void usage(void)
   puts("GPlay ver " VER "          " __DATE__);
 #ifdef __OS2__
   puts("mpg123 frontend for OS/2");
+#elif defined(UNIX)
+  puts("mpg123 frontend for Unix");
 #else
   puts("mpg123 frontend for Win");
 #endif
@@ -2062,13 +2460,14 @@ void usage(void)
   puts("-@ <listname> - load playlist");
   puts("-c <confname> - set config name (default is gplay.cfg)");
   puts("-s <path>     - set start directory");
+  puts("-d <level>    - set debug level");
   puts("-f            - play forever");
   puts("-p            - play mode (no menu)");
   puts("-r            - random order");
 }
           
 int main(int argc, char * argv[])
-{ int col, r, pid;
+{ int col, r;
   char curdir[1024] = "";
   int setvolume=0;
   char *confname = NULL;
@@ -2079,7 +2478,7 @@ int main(int argc, char * argv[])
   optind = 0;
   for (;;)
   {
-    switch (getopt(argc, argv, "V:c:s:@:fph-"))
+    switch (getopt(argc, argv, "V:c:s:@:fphd:-"))
     {
       case 'c':	confname = optarg;
 		continue;
@@ -2095,6 +2494,10 @@ int main(int argc, char * argv[])
 		continue;
       case '@':	listfiles[nlistfiles++] = strdup(optarg);
 		continue;
+      case 'd': debuglevel = atoi(optarg);
+		getcwd(dbgname, 256);
+		strcat(dbgname, PATHSEPS "dbg.log");
+		continue;
       case '?':
       case ':':
       case 'h':	usage();
@@ -2107,6 +2510,9 @@ int main(int argc, char * argv[])
   }
   if (wasusage)
     return 1;
+#ifdef UNIX
+  setlocale(LC_ALL, "");
+#endif
   config(confname);
 debug(2, "config() ok");
   if (opendb()==0)
@@ -2123,14 +2529,18 @@ debug(2, "opendb ok");
   if (volume<0 || volume>100)
     volume = 50;
   if (curdir[0])
-  { if (curdir[1] == ':')
+  {
+#ifndef UNIX
+    if (curdir[1] == ':')
 #ifdef __OS2__
       DosSetDefaultDisk(toupper(curdir[0])-'A'+1);
 #else
       _chdrive(toupper(curdir[0])-'A'+1);
 #endif
+#endif
     chdir(curdir);
   }
+  gulib_init();
   initmouse();
   askmouse();
   /* setmouserep(2); */
@@ -2139,53 +2549,93 @@ debug(2, "opendb ok");
   pole=topline=0;
   phonebiginkey=skyf+black;
   fnbiginkey=blackf+white;
+  scrollcol=bluef+white;
   head=malloc(maxy);
-  if (head==NULL) return 1;
-  strcpy(head,"");
+  if (head==NULL) {
+    gulib_deinit();
+    return 1;
+  }
+  head[0] = '\0';
   paused=playing=0;
+#ifdef UNIX
+  pthread_mutex_init(&sem_refresh, NULL);
+  { int h[2];
+    pipe(h);
+    resppipein =fdopen(h[0], "r");
+    resppipeout=fdopen(h[1], "w");
+    pthread_create(&inkeytid, NULL, inkey_thread, NULL);
+    inkey=pipeinkey;
+    debug(2, "inkey thread created");
+    pipe(edpipe);
+  }
+  signal(SIGCHLD, rip);
+  signal(SIGPIPE, SIG_IGN);
+#endif
 debug(2, "running mpg123...");
-  pid=run123();
-  if (pid==-1)
+  run123();
+  if (pid123==-1)
   { remenu();
 debug(2, "run failed");
+    gulib_deinit();
     return 3;
   }
 debug(2, "run ok");
-  sendcmd("volume %d", volume);
-debug(2, "sendcmd ok");
-  resp(1);
-  resp(1);
-debug(2, "set volume ok");
+debug(5, "unattended is %s, playlist %s", unattended ? "on" : "off", lhead ? "filled" : "empty");
   if (unattended && lhead)
   { play();
     if (dbopened)
       closedb();
     remenu();
     sendcmd("q");
-    waitpid(pid, &r, 0);
+    waitpid(pid123, &r, 0);
+    gulib_deinit();
     return 0;
   }
   loaddir();
 debug(2, "loaddir done");
-  barcell((col_menu_title<<8)|' ', 0, 0, 1, maxy);
+  barputcol(col_menu_title, 0, 0, 1, maxy);
+  barfill(' ', 0, 0, 1, maxy);
 debug(2, "barcell done");
+  // while (resp(0));
   for (;;)
   {
-    while (resp(0));
-debug(2, "resp queue cleared");
     inkey=myinkey;
-    sprintf(head, " Volume %02d%%   Marked %4d  %16s",
+    snprintf(head, maxy-1, " Volume %3d%%   Marked %4d  %16s",
             volume, inlist, forever ? "Playing forever" : "");
+    head[maxy-1] = '\0';
     cline(0, 0, head);
 debug(2, "cline head done");
     getcwd(curdir, sizeof(curdir));
     convcwd(curdir);
-    sprintf(head, " Current dir: [%s] ", curdir);
+    if (maxy>23)
+    {
+      char *p, *p1;
+      char line[1024];
+
+      p = xlat(dir_charset, scr_charset, curdir);
+      if (strlen(p) + 19 > maxy)
+      {
+        strcpy(line, "...");
+        p = p + strlen(p) + 19 - maxy;
+        p1 = strchr(p+3, PATHSEP);
+	if (p1)
+          strcpy(line+3, p1);
+        else
+          strcpy(line+3, p+3);
+        sprintf(head, " Current dir: [%s] ", line);
+      } else
+        sprintf(head, " Current dir: [%s] ", p);
+    } else
+      head[0] = '\0';
 debug(2, "calling scrlmenuf");
     r=scrlmenuf(col_menu_normal, col_menu_select, 1, 0, maxx-4, maxy-2, head,
                 &pole, &topline, poley, putline);
-debug(2, "scrlmenuf done");
+debug(2, "scrlmenuf done, retcode %02x", r);
+#ifdef UNIX
+    inkey=pipeinkey;
+#else
     inkey=_inkey;
+#endif
     scrlmenu_redraw=0;
     rnd=0;
     switch (r)
@@ -2196,6 +2646,7 @@ debug(2, "scrlmenuf done");
         break;
       case enterc:
       case mouse_enter:
+#ifndef UNIX
         if (lem[pole].filename[1] == ':')
         { /* disk */
 #ifdef __OS2__
@@ -2208,7 +2659,9 @@ debug(2, "scrlmenuf done");
           pole = topline = 0;
           scrlmenu_redraw=REDRAW_FULL;
         }
-        else if (lem[pole].filename[strlen(lem[pole].filename)-1] == PATHSEP)
+        else
+#endif
+        if (lem[pole].filename[strlen(lem[pole].filename)-1] == PATHSEP)
         { /* dir */
           char *newpos, *p;
           lem[pole].filename[strlen(lem[pole].filename)-1] = '\0';
@@ -2242,13 +2695,14 @@ debug(2, "scrlmenuf done");
 enterkey:
         { /* single file */
           struct listtype *savehead=lhead, *savetail=ltail;
-          int savetag=lem[pole].tag;
+          int savetag=lem[pole].tag, saveinlist=inlist;
           lhead=ltail=NULL;
           addlist(lem+pole);
           play();
           cleanlist();
           lhead=savehead;
           ltail=savetail;
+	  inlist=saveinlist;
           lem[pole].tag=savetag;
           scrlmenu_redraw=REDRAW_TEXT;
         }
@@ -2259,23 +2713,30 @@ tagentry:
         if (lem[pole].size == 0)
           continue;
         lem[pole].tag^=1;
-        back_key(downc, 0);
         if (lem[pole].tag)
           addlist(lem+pole);
         else
           dellist(lem+pole);
+        if (pole < poley) {
+          pole++;
+          if (pole-topline >= maxx-1) topline++;
+        }
         continue;
       case rightc:
         if (volume==100)
           continue;
         sendcmd("V %d", volume+=5);
+#if !defined(UNIX) || defined(HAVE_RVOLUME)
         resp(1);
+#endif
         continue;
       case leftc:
         if (volume==0)
           continue;
         sendcmd("V %d", volume-=5);
+#if !defined(UNIX) || defined(HAVE_RVOLUME)
         resp(1);
+#endif
         continue;
       case f4c:
         if (dbopened)
@@ -2308,22 +2769,64 @@ tagentry:
         search(-1);
         continue;
       case f8c:
+delfile:
         r=0;
-        quere(redf+very+white, whitef+black, 10, 20, 2, 2, &r,
+        quere(redf+very+yellow, whitef+black, 10, 20, 2, 2, &r,
               " Delete file ", lem[pole].filename,
-              " Yes ", "Yy", " No ", "Nn");
+              " Yes ", "Yy", " No ", "Nn\x1b");
         if (r==1)
           continue;
         unlink(lem[pole].filename);
         loaddir();
-        pole = topline = 0;
+        if (pole>=poley) pole = poley-1;
+        if (topline && topline>poley-(maxx-4))
+        { topline = poley-(maxx-4);
+          if (topline<0) topline=0;
+	}
         scrlmenu_redraw=REDRAW_FULL;
         continue;
+      case f1c:
+showhelp:
+	{ int i=1;
+#define col 12
+          ramka(bluef+very+yellow, i++, col-2, 22, 60);
+          cline(i++, col, "Ins, Space    -- tag (mark) song");
+          cline(i++, col, "Enter         -- play song");
+          cline(i++, col, "'p'           -- play tagged songs");
+          cline(i++, col, "'f'           -- circle play (forever)");
+          cline(i++, col, "'a', '*'      -- toggle all tags");
+          cline(i++, col, "'c'           -- clear all tags");
+          cline(i++, col, "'r'           -- set random order");
+          cline(i++, col, "'n'           -- restart mpg123");
+          cline(i++, col, "'R'           -- reread directory");
+          cline(i++, col, "'+', ->       -- increase volume");
+          cline(i++, col, "'-', <-       -- decrease volume");
+          cline(i++, col, "f1, 'h'       -- this help");
+          cline(i++, col, "f2, 's'       -- save tagged as playlist");
+          cline(i++, col, "f3, 'l'       -- add playlist to tagged");
+          cline(i++, col, "ctrl+f3, 'A'  -- clear tags and load playlist");
+          cline(i++, col, "f4, 'e'       -- edit description");
+          cline(i++, col, "f7, '/'       -- search forward");
+          cline(i++, col, "alt+f7, '?'   -- search backward");
+          cline(i++, col, "f8, 'd'       -- delete file");
+          cline(i++, col, "f10, Esc, 'q' -- exit gplay");
+#undef col
+        }
+        inkey();
+        remenu();
+        continue;
       default:
-        switch(r & 0xff)
+        switch (r & 0xff)
         {
           case ' ':
+          case 't':
             goto tagentry;
+          case 'd':
+            goto delfile;
+          case 'h':
+            goto showhelp;
+          case 'q':
+            break;
           case 'a':
 #if 0 /* not only mark, do mark/unmark as '*' */
             { int i;
@@ -2363,13 +2866,17 @@ tagentry:
             if (volume==100)
               continue;
             sendcmd("V %d", volume+=5);
+#if !defined(UNIX) || defined(HAVE_RVOLUME)
             resp(1);
+#endif
             continue;
           case '-':
             if (volume==0)
               continue;
             sendcmd("V %d", volume-=5);
+#if !defined(UNIX) || defined(HAVE_RVOLUME)
             resp(1);
+#endif
             continue;
           case 'r':
             rnd=1;
@@ -2396,7 +2903,7 @@ tagentry:
 #else
             fclose(mpgin);
 #endif
-            waitpid(pid, &r, 0);
+            waitpid(pid123, &r, 0);
 #ifdef __CYGWIN__
 	    CloseHandle(mpgin);
 #else
@@ -2406,17 +2913,18 @@ tagentry:
             DosWaitThread(&resptid, DCWW_WAIT);
             fclose(resppipein);
             fclose(resppipeout);
+#elif defined(UNIX)
+            fclose(resppipeout);
+            fclose(resppipein);
 #else
             waitthread(resptid);
 #endif
-            pid=run123();
-            if (pid==-1)
+            run123();
+            if (pid123==-1)
             { remenu();
+              gulib_deinit();
               return 3;
             }
-            sendcmd("volume %d", volume);
-            resp(1);
-            resp(1);
             continue;
           case '/':
             search(1);
@@ -2424,8 +2932,26 @@ tagentry:
           case '?':
             search(-1);
             continue;
+          case 's':
+            savelist();
+            continue;
+          case 'l':
+            if (loadlist(1) == 0)
+              scrlmenu_redraw=REDRAW_TEXT;
+            continue;
+          case 'e':
+            if (dbopened)
+            { editsong(pole);
+              scrlmenu_redraw=REDRAW_TEXT;
+            }
+            continue;
+          case 'A':
+            if (loadlist(0) == 0)
+              scrlmenu_redraw=REDRAW_TEXT;
+            continue;
+          default:
+            continue;
         }
-        continue;
     }
     break;
   }
@@ -2433,6 +2959,7 @@ tagentry:
     closedb();
   remenu();
   sendcmd("q");
-  waitpid(pid, &r, 0);
+  waitpid(pid123, &r, 0);
+  gulib_deinit();
   return 0;
 }

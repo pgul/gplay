@@ -2,10 +2,14 @@
 #include <stdarg.h>
 #include <time.h>
 #include <string.h>
+#ifndef UNIX
 #include <malloc.h>
-#include <io.h>
+#endif
 #include <stdlib.h>
-#ifdef __CYGWIN__
+#ifndef UNIX
+#include <io.h>
+#endif
+#if defined(__CYGWIN__) || defined(UNIX)
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -39,22 +43,13 @@ static struct hashlem {
 
 static unsigned long crc32(char *str);
 
-#ifdef __CYGWIN__
+#if defined(__CYGWIN__) || defined(UNIX)
 long filelength(int h)
 { struct stat st;
   if (fstat(h, &st)) return -1;
   return st.st_size;
 }
 #endif
-
-static void debug(int level, char *format, ...)
-{ va_list arg;
-
-  va_start(arg,format);
-  vfprintf(stderr,format,arg);
-  va_end(arg);
-  fputs("\n", stderr);
-}
 
 int opendb(void)
 { long l;
@@ -132,7 +127,7 @@ int savedb(void)
   if (r == 1)
   { if (fflush(fhash) == EOF)
       r = -1;
-#if defined(__OS2__) || defined(__CYGWIN__)
+#if defined(__OS2__) || defined(__CYGWIN__) || defined(UNIX)
     ftruncate(fileno(fhash), sizeof(*hashhead)+hashhead->tabsize*sizeof(*hash));
 #else
     chsize(fileno(fhash), sizeof(*hashhead)+hashhead->tabsize*sizeof(*hash));
@@ -365,7 +360,7 @@ int purgedb(void)
   }
   line = 0;
   curoffs = 0;
-  for(curoffs=0; fgets(str, sizeof(str), fdb); curoffs=ftell(fdb))
+  for (curoffs=0; fgets(str, sizeof(str), fdb); curoffs=ftell(fdb))
   {
     line++;
     if (strchr(str, '\n') == NULL)

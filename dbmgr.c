@@ -34,7 +34,7 @@ static void usage(void)
   fputs("index [-s tabsize]                - rebuild db index\n", stderr);
 }
 
-static int add(char *argv[], int argc, int *argi)
+static int cmdadd(char *argv[], int argc, int *argi)
 {
   unsigned long size = 0;
   char *fname, *descr, *p, *p1;
@@ -183,7 +183,7 @@ int main(int argc, char *argv[])
     { if (i+2 < argc)
       { 
 // fprintf(stderr, "Call add\n");
-        rc |= add(argv, argc, &i);
+        rc |= cmdadd(argv, argc, &i);
         wastask = 1;
       }
       else
