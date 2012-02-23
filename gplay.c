@@ -1305,7 +1305,7 @@ comment     : [--== ZoLtaR's MP3 Archive ==--žž]
     do
     { p=resp(1);
 debug(2, "play: waiting for play start, got %s", p ? p : "NULL");
-    } while (p==NULL || (p && p[1]!='S' && p[1]!='P' && p[1]!='Q'));
+    } while (p==NULL || (p && p[1]!='S' && (p[1]!='P' || strncmp(p+1, "P 2", 3)) && p[1]!='Q'));
     if (p && strnicmp(p, "@P 0", 4) == 0)
     { debug(2, "Next song");
       cur = nextsong(cur, 1);
@@ -1320,31 +1320,33 @@ debug(2, "play: waiting for play start, got %s", p ? p : "NULL");
     putcol(col_play_firstlet, 5, 6, 1);
     putcol(col_play_hilight2, 5, 13, 1);
     putcol(col_play_hilight, 5, 16, 64);
-    cline(5, 1, "file info   :");
-    p=strtok(p, " \t");
-    ftype = strtok(NULL, " \t");
-    if (ftype == NULL) ftype = "?";
-    p = strtok(NULL, " \t"); /* layer */
-    layer = p ? atoi(p) : 1;
-    p = strtok(NULL, " \t"); /* sf */
-    sf = p ? atoi(p) : 0;
-    fmode = strtok(NULL, " \t");
-    if (fmode == NULL) fmode = "?";
-    p = strtok(NULL, " \t"); /* mode ext */
-    p = strtok(NULL, " \t"); /* frame size */
-    stereo = atoi(strtok(NULL, " \t"));
-    p = strtok(NULL, " \t"); /* copyright */
-    p = strtok(NULL, " \t"); /* error prot */
-    p = strtok(NULL, " \t"); /* emphasis */
-    p = strtok(NULL, " \t"); /* bitrate */
-    bitrate = p ? atoi(p) : 0;
-    p = strtok(NULL, " \t"); /* extension */
-    strlwr(fmode);
-    sprintf(str, "mpeg %s layer %s, %ukbit/s, %u Hz %s",
-            ftype, (layer == 1 ? "I" : (layer == 2 ? "II" : "III")),
-            bitrate, sf, fmode);
-    cline(5, 16, str);
-    
+    if (p[1] == 'S') {
+      cline(5, 1, "file info   :");
+      p=strtok(p, " \t");
+      ftype = strtok(NULL, " \t");
+      if (ftype == NULL) ftype = "?";
+      p = strtok(NULL, " \t"); /* layer */
+      layer = p ? atoi(p) : 1;
+      p = strtok(NULL, " \t"); /* sf */
+      sf = p ? atoi(p) : 0;
+      fmode = strtok(NULL, " \t");
+      if (fmode == NULL) fmode = "?";
+      p = strtok(NULL, " \t"); /* mode ext */
+      p = strtok(NULL, " \t"); /* frame size */
+      stereo = p ? atoi(strtok(NULL, " \t")) : 0;
+      p = strtok(NULL, " \t"); /* copyright */
+      p = strtok(NULL, " \t"); /* error prot */
+      p = strtok(NULL, " \t"); /* emphasis */
+      p = strtok(NULL, " \t"); /* bitrate */
+      bitrate = p ? atoi(p) : 0;
+      p = strtok(NULL, " \t"); /* extension */
+      strlwr(fmode);
+      sprintf(str, "mpeg %s layer %s, %ukbit/s, %u Hz %s",
+              ftype, (layer == 1 ? "I" : (layer == 2 ? "II" : "III")),
+              bitrate, sf, fmode);
+      cline(5, 16, str);
+    }
+
     putcol(col_play_firstlet, 12,  1, 1);
     putcol(col_play_text,     12,  2,17);
     putcol(col_play_firstlet, 12,  7, 1);
